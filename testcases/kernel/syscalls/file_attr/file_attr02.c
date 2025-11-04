@@ -102,6 +102,10 @@ static struct tst_test test = {
 		},
 		{}
 	},
+	.needs_kconfigs = (const char *[]) {
+		"CONFIG_XFS_FS",
+		NULL
+	},
 	.bufs = (struct tst_buffers []) {
 		{&attr, .size = sizeof(struct file_attr)},
 		{}
