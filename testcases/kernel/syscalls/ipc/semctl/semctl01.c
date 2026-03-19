@@ -8,6 +8,7 @@
 
 #define _GNU_SOURCE
 #include <stdlib.h>
+#include <pthread.h>
 #include "tst_safe_sysv_ipc.h"
 #include "tst_test.h"
 #include "lapi/sem.h"
@@ -18,13 +19,15 @@
 #define NCHILD  5
 #define SEMUN_CAST (union semun)
 
-static int sem_id = -1;
-static int sem_index;
+static __thread int sem_id = -1;
+static __thread int sem_index;
 static struct semid_ds buf;
 static struct seminfo ipc_buf;
 static unsigned short array[PSEMS];
 static struct sembuf sops;
 static int pid_arr[NCHILD];
+
+static pthread_mutex_t sem_stat_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void kill_all_children(void)
 {
@@ -243,28 +246,36 @@ static struct tcases {
 	union semun arg;
 	void (*func_setup) ();
 } tests[] = {
-	{&sem_id, 0, IPC_STAT, func_stat, SEMUN_CAST & buf, NULL},
-	{&sem_id, 0, IPC_SET, func_set, SEMUN_CAST & buf, set_setup},
-	{&sem_id, 0, GETALL, func_gall, SEMUN_CAST array, NULL},
-	{&sem_id, 4, GETNCNT, func_cnt, SEMUN_CAST & buf, cnt_setup},
-	{&sem_id, 2, GETPID, func_pid, SEMUN_CAST & buf, pid_setup},
-	{&sem_id, 2, GETVAL, func_gval, SEMUN_CAST & buf, NULL},
-	{&sem_id, 4, GETZCNT, func_cnt, SEMUN_CAST & buf, cnt_setup},
-	{&sem_id, 0, SETALL, func_sall, SEMUN_CAST array, sall_setup},
-	{&sem_id, 4, SETVAL, func_sval, SEMUN_CAST INCVAL, NULL},
-	{&sem_id, 0, IPC_INFO, func_iinfo, SEMUN_CAST & ipc_buf, NULL},
-	{&sem_id, 0, SEM_INFO, func_sinfo, SEMUN_CAST & ipc_buf, NULL},
-	{&sem_index, 0, SEM_STAT, func_sstat, SEMUN_CAST & buf, NULL},
-	{&sem_id, 0, IPC_RMID, func_rmid, SEMUN_CAST & buf, NULL},
+	{NULL, 0, IPC_STAT, func_stat, SEMUN_CAST & buf, NULL},
+	{NULL, 0, IPC_SET, func_set, SEMUN_CAST & buf, set_setup},
+	{NULL, 0, GETALL, func_gall, SEMUN_CAST array, NULL},
+	{NULL, 4, GETNCNT, func_cnt, SEMUN_CAST & buf, cnt_setup},
+	{NULL, 2, GETPID, func_pid, SEMUN_CAST & buf, pid_setup},
+	{NULL, 2, GETVAL, func_gval, SEMUN_CAST & buf, NULL},
+	{NULL, 4, GETZCNT, func_cnt, SEMUN_CAST & buf, cnt_setup},
+	{NULL, 0, SETALL, func_sall, SEMUN_CAST array, sall_setup},
+	{NULL, 4, SETVAL, func_sval, SEMUN_CAST INCVAL, NULL},
+	{NULL, 0, IPC_INFO, func_iinfo, SEMUN_CAST & ipc_buf, NULL},
+	{NULL, 0, SEM_INFO, func_sinfo, SEMUN_CAST & ipc_buf, NULL},
+	{NULL, 0, SEM_STAT, func_sstat, SEMUN_CAST & buf, NULL},
+	{NULL, 0, IPC_RMID, func_rmid, SEMUN_CAST & buf, NULL},
 };
 
 static void verify_semctl(unsigned int n)
 {
 	struct tcases *tc = &tests[n];
-	int rval;
+	int rval, sid;
+	int retries = 5;
 
-	if (sem_id == -1)
-		sem_id = SAFE_SEMGET(IPC_PRIVATE, PSEMS, IPC_CREAT | IPC_EXCL | SEM_RA);
+	/* Resolve sem id: SEM_STAT uses sem_index, others use sem_id */
+	if (tc->cmd == SEM_STAT)
+		sid = sem_index;
+	else {
+		sid = sem_id;
+		if (sid == -1)
+			sem_id = sid = SAFE_SEMGET(IPC_PRIVATE, PSEMS, IPC_CREAT | IPC_EXCL | SEM_RA);
+	}
+
 	if (tc->func_setup) {
 		switch (tc->cmd) {
 		case GETNCNT:
@@ -279,21 +290,41 @@ static void verify_semctl(unsigned int n)
 		}
 	}
 
-	rval = SAFE_SEMCTL(*(tc->semid), tc->semnum, tc->cmd, tc->arg);
-	switch (tc->cmd) {
-	case GETNCNT:
-	case GETZCNT:
-	case GETPID:
-	case GETVAL:
-	case IPC_INFO:
-	case SEM_STAT:
+	/* SEM_STAT: get index under lock, call SEM_STAT without lock, retry on EIDRM and EINVAL */
+	if (tc->cmd == SEM_STAT) {
+		do {
+			pthread_mutex_lock(&sem_stat_lock);
+			sem_index = semctl(0, 0, IPC_INFO, (union semun)&ipc_buf);
+			pthread_mutex_unlock(&sem_stat_lock);
+			if (sem_index < 0)
+				tst_brk(TBROK | TERRNO, "semctl(0, 0, IPC_INFO)");
+			rval = semctl(sem_index, 0, tc->cmd, tc->arg);
+			if (rval >= 0)
+				break;
+			if ((errno != EIDRM && errno != EINVAL) || --retries <= 0)
+				tst_brk(TBROK | TERRNO, "semctl(SEM_STAT)");
+		} while (1);
 		tc->func_test(rval);
-		break;
-	default:
+	} else if (tc->cmd == IPC_RMID) {
+		pthread_mutex_lock(&sem_stat_lock);
+		SAFE_SEMCTL(sid, tc->semnum, tc->cmd, tc->arg);
+		pthread_mutex_unlock(&sem_stat_lock);
 		tc->func_test();
-		break;
+	} else {
+		rval = SAFE_SEMCTL(sid, tc->semnum, tc->cmd, tc->arg);
+		switch (tc->cmd) {
+		case GETNCNT:
+		case GETZCNT:
+		case GETPID:
+		case GETVAL:
+		case IPC_INFO:
+			tc->func_test(rval);
+			break;
+		default:
+			tc->func_test();
+			break;
+		}
 	}
-
 	if (tc->cmd == GETNCNT || tc->cmd == GETZCNT)
 		kill_all_children();
 }
