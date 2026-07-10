@@ -44,6 +44,7 @@ static void verify_pipe(unsigned int n)
 	int ret;
 	unsigned int i, cnt = 0, sleep_us = 1, fail = 0;
 	unsigned int child_num = tcases[n];
+	unsigned int sleep_us_cap = tst_multiply_timeout(1000) * 1000U;
 	int pid[child_num];
 
 	SAFE_PIPE(fds);
@@ -60,7 +61,7 @@ static void verify_pipe(unsigned int n)
 	SAFE_CLOSE(fds[0]);
 	SAFE_CLOSE(fds[1]);
 
-	while (cnt < child_num && sleep_us < 1000000) {
+	while (cnt < child_num && sleep_us < sleep_us_cap) {
 		ret = waitpid(-1, NULL, WNOHANG);
 		if (ret < 0)
 			tst_brk(TBROK | TERRNO, "waitpid()");
